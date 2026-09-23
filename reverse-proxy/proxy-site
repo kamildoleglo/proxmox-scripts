@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Manages the reverse proxy's sites, one file per hostname in /etc/caddy/sites/.
+# Every change is validated before Caddy reloads, and rolled back if it's invalid.
+set -euo pipefail
+
+SITES=/etc/caddy/sites
+
+usage() {
+    cat <<'EOF'
+Usage:
+  proxy-site add <hostname> <backend> [--insecure]
+      backend: IP:port, or https://IP:port for a backend serving HTTPS.
+      --insecure skips verifying the backend's certificate (self-signed, e.g. Proxmox UI).
+  proxy-site rm <hostname>
+  proxy-site list
+EOF
+    exit "${1:-0}"
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# Validates the whole config and reloads Caddy; on failure restores $1 from $1.bak
+# (or removes $1 if there was no backup).
+apply() {
+    local file=$1 out
+    # shellcheck source=/dev/null
+    if ! out="$(set -a; . /etc/caddy/caddy.env; caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile 2>&1)"; then
+        if [[ -f $file.bak ]]; then mv "$file.bak" "$file"; else rm -f "$file"; fi
+        echo "$out" | tail -n 3 >&2
+        die "invalid config, change rolled back"
+    fi
+    rm -f "$file.bak"
+    systemctl reload caddy
+}
+
+cmd_add() {
+    [[ $# -ge 2 ]] || usage 1
+    local host=${1,,} backend=$2 insecure=${3:-} file
+    local host_re='^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+    local backend_re='^(https?://)?[][A-Za-z0-9.:_-]+$'   # host:port, IPv6 in [brackets]
+    [[ $host =~ $host_re ]] || die "invalid hostname: $host"
+    [[ $backend =~ $backend_re ]] || die "invalid backend: $backend"
+    [[ -z $insecure || ($insecure == --insecure && $backend == https://*) ]] \
+        || die "--insecure only applies to https:// backends"
+
+    file="$SITES/$host.caddy"
+    [[ -f $file ]] && cp "$file" "$file.bak"
+    {
+        echo "# Managed by proxy-site"
+        echo "$host {"
+        echo "	import cloudflare_only"
+        if [[ -n $insecure ]]; then
+            printf '\treverse_proxy %s {\n\t\ttransport http {\n\t\t\ttls_insecure_skip_verify\n\t\t}\n\t}\n' "$backend"
+        else
+            echo "	reverse_proxy $backend"
+        fi
+        echo "}"
+    } > "$file"
+    apply "$file"
+    echo "$host -> $backend"
+}
+
+cmd_rm() {
+    [[ $# -eq 1 ]] || usage 1
+    local file="$SITES/${1,,}.caddy"
+    [[ -f $file ]] || die "no such site: $1"
+    mv "$file" "$file.bak"
+    apply "$file"
+    echo "removed $1"
+}
+
+cmd_list() {
+    local f
+    shopt -s nullglob
+    for f in "$SITES"/*.caddy; do
+        printf '%-40s %s\n' "$(basename "$f" .caddy)" "$(awk '/reverse_proxy/ {print $2; exit}' "$f")"
+    done
+}
+
+[[ $EUID -eq 0 ]] || die "run as root"
+case "${1:-}" in
+    add)  shift; cmd_add "$@" ;;
+    rm)   shift; cmd_rm "$@" ;;
+    list) cmd_list ;;
+    -h|--help|help) usage ;;
+    *) usage 1 ;;
+esac

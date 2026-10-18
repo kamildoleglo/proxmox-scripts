@@ -115,10 +115,13 @@ for f in setup.sh cloudflare-ips.sh proxy-site; do
     curl -fsSL "$REPO_RAW/reverse-proxy/$f" -o "$tmp/$f"
 done
 
-log "Resolving latest Debian 13 template"
+ARCH="$(dpkg --print-architecture)"         # amd64, arm64, ...
+log "Resolving latest Debian 13 template for $ARCH"
 pveam update >/dev/null
-TEMPLATE="$(pveam available --section system | awk '/debian-13-standard/ {print $2}' | sort -V | tail -n1)"
-[[ -n $TEMPLATE ]] || die "no debian-13-standard template available"
+# The list mixes architectures, so filter on ours before picking the newest.
+TEMPLATE="$(pveam available --section system \
+    | awk -v arch="$ARCH" '$2 ~ "^debian-13-standard_.*_" arch "\\.tar" {print $2}' | sort -V | tail -n1)"
+[[ -n $TEMPLATE ]] || die "no debian-13-standard template available for $ARCH"
 if ! pveam list "$TEMPLATE_STORAGE" | grep -q "$TEMPLATE"; then
     log "Downloading $TEMPLATE"
     pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
@@ -131,6 +134,7 @@ extra=()
 
 log "Creating container $CTID ($CT_HOSTNAME)"
 pct create "$CTID" "$TEMPLATE_STORAGE:vztmpl/$TEMPLATE" \
+    --arch "$ARCH" \
     --hostname "$CT_HOSTNAME" \
     --cores "$CORES" \
     --memory "$MEMORY" \

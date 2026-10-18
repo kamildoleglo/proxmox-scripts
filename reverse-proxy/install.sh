@@ -4,8 +4,10 @@
 #
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/kamildoleglo/proxmox-scripts/main/reverse-proxy/install.sh)"
 #
-# Asks for anything not already set. For unattended runs, set these env vars:
-#   CF_API_TOKEN, ACME_EMAIL, CTID, IP, GW  (plus the optional ones below)
+# Walks you through creating a Cloudflare Origin CA certificate and asks for
+# anything not already set. For unattended runs, set these env vars:
+#   ORIGIN_CERT, ORIGIN_KEY (paths to the PEM files), CTID, IP, GW
+#   (plus the optional ones below)
 set -euo pipefail
 
 REPO_REF="${REPO_REF:-main}"
@@ -20,33 +22,85 @@ MEMORY="${MEMORY:-512}"                    # MiB
 DISK="${DISK:-4}"                          # GiB
 SSH_PUBKEY="${SSH_PUBKEY:-}"               # optional path to an authorized_keys file
 
+bold=$'\e[1m' reset=$'\e[0m'
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
-# ask VAR "prompt" [default] [secret] - prompts on the terminal unless VAR is already set.
+# ask VAR "prompt" [default] - prompts on the terminal unless VAR is already set.
 ask() {
-    local var=$1 prompt=$2 def=${3:-} secret=${4:-} ans
+    local var=$1 prompt=$2 def=${3:-} ans
     [[ -n ${!var:-} ]] && return
-    if [[ -n $secret ]]; then
-        read -rsp "$prompt: " ans </dev/tty; echo
-    else
-        read -rp "$prompt${def:+ [$def]}: " ans </dev/tty
-    fi
+    read -rp "$prompt${def:+ [$def]}: " ans </dev/tty
     printf -v "$var" '%s' "${ans:-$def}"
+}
+
+# read_pem FILE "label" [secret] - reads one pasted PEM block from the terminal.
+read_pem() {
+    local file=$1 label=$2 secret=${3:-} line started=""
+    local opts=()
+    [[ -n $secret ]] && opts+=(-s)
+    echo "Paste the ${bold}$label${reset} (from -----BEGIN to -----END), then press Enter:"
+    : > "$file"
+    while IFS= read -r "${opts[@]}" line </dev/tty; do
+        # Trim surrounding whitespace and CRs that terminals add when pasting.
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z $line ]] && continue
+        [[ -z $started && $line != -----BEGIN* ]] && continue
+        started=1
+        printf '%s\n' "$line" >> "$file"
+        [[ $line == -----END* ]] && break
+    done
+    if [[ -n $secret ]]; then echo "(received)"; fi
 }
 
 [[ $EUID -eq 0 ]] || die "run as root on the Proxmox host"
 command -v pct >/dev/null || die "pct not found - is this a Proxmox host?"
 
-ask CF_API_TOKEN "Cloudflare API token (Zone:DNS:Edit)" "" secret
-[[ -n $CF_API_TOKEN ]] || die "a Cloudflare API token is required"
-# Header goes through a file descriptor so the token never shows up in `ps`.
-curl -fsS -H @<(printf 'Authorization: Bearer %s\n' "$CF_API_TOKEN") \
-    https://api.cloudflare.com/client/v4/user/tokens/verify | grep -q '"status":"active"' \
-    || die "Cloudflare rejected the API token"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+chmod 700 "$tmp"
 
-ask ACME_EMAIL "Email for Let's Encrypt expiry notices"
-[[ $ACME_EMAIL == *@*.* ]] || die "invalid email: $ACME_EMAIL"
+# --- Certificate -------------------------------------------------------------
+if [[ -n ${ORIGIN_CERT:-} || -n ${ORIGIN_KEY:-} ]]; then
+    [[ -f ${ORIGIN_CERT:-} && -f ${ORIGIN_KEY:-} ]] || die "ORIGIN_CERT and ORIGIN_KEY must both point to files"
+    install -m 0600 "$ORIGIN_CERT" "$tmp/origin.pem"
+    install -m 0600 "$ORIGIN_KEY" "$tmp/origin.key"
+else
+    cat <<EOF
+
+${bold}Step 1/2: Cloudflare Origin CA certificate${reset}
+Caddy presents this certificate to Cloudflare. It's free, lasts up to 15 years
+and covers all your subdomains, so you only do this once.
+
+  1. Open https://dash.cloudflare.com and select your domain.
+  2. Go to SSL/TLS -> Origin Server -> Create Certificate.
+  3. Keep "Generate private key and CSR with Cloudflare" and key type RSA (2048).
+  4. Hostnames: keep both "*.yourdomain" and "yourdomain".
+  5. Certificate Validity: 15 years. Click Create.
+  6. Keep that page open. Cloudflare shows the private key only once.
+
+EOF
+    read_pem "$tmp/origin.pem" "Origin Certificate"
+    echo
+    read_pem "$tmp/origin.key" "Private Key (input is hidden)" secret
+fi
+
+openssl x509 -in "$tmp/origin.pem" -noout 2>/dev/null || die "that is not a valid certificate"
+openssl pkey -in "$tmp/origin.key" -noout 2>/dev/null || die "that is not a valid private key"
+[[ "$(openssl x509 -in "$tmp/origin.pem" -noout -pubkey)" == "$(openssl pkey -in "$tmp/origin.key" -pubout)" ]] \
+    || die "the private key doesn't belong to the certificate"
+openssl x509 -in "$tmp/origin.pem" -noout -checkend 0 >/dev/null || die "the certificate has expired"
+if [[ "$(openssl x509 -in "$tmp/origin.pem" -noout -issuer)" != *"CloudFlare Origin"* ]]; then
+    echo "warning: not issued by Cloudflare's Origin CA; Cloudflare will only accept it if it's publicly trusted" >&2
+fi
+cert_hosts="$(openssl x509 -in "$tmp/origin.pem" -noout -ext subjectAltName | grep -o 'DNS:[^,]*' | cut -d: -f2 | paste -sd' ')"
+cert_until="$(openssl x509 -in "$tmp/origin.pem" -noout -enddate | cut -d= -f2)"
+echo "Certificate OK: covers ${bold}$cert_hosts${reset}, valid until $cert_until"
+
+# --- Container settings ------------------------------------------------------
+echo
+echo "${bold}Step 2/2: Container settings${reset}"
 ask CTID "Container ID" "$(pvesh get /cluster/nextid)"
 pct status "$CTID" &>/dev/null && die "container $CTID already exists"
 ask IP "Container IP in CIDR form, or dhcp (static recommended for port forwarding)" "dhcp"
@@ -54,14 +108,12 @@ if [[ $IP != dhcp ]]; then
     ask GW "Gateway"
     [[ -n $GW ]] || die "a gateway is required for a static IP"
 fi
+echo
 
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
 log "Fetching scripts from $REPO_RAW"
-for f in setup.sh cf-origin-firewall.sh proxy-site; do
+for f in setup.sh cloudflare-ips.sh proxy-site; do
     curl -fsSL "$REPO_RAW/reverse-proxy/$f" -o "$tmp/$f"
 done
-(umask 077; printf 'CF_API_TOKEN=%s\n' "$CF_API_TOKEN" > "$tmp/caddy.env")
 
 log "Resolving latest Debian 13 template"
 pveam update >/dev/null
@@ -99,22 +151,26 @@ done
 pct exec "$CTID" -- getent hosts deb.debian.org >/dev/null 2>&1 || die "container has no network/DNS"
 
 log "Installing Caddy and firewall"
-for f in setup.sh cf-origin-firewall.sh proxy-site; do
+for f in setup.sh cloudflare-ips.sh proxy-site; do
     pct push "$CTID" "$tmp/$f" "/root/$f" --perms 0755
 done
-pct push "$CTID" "$tmp/caddy.env" /root/caddy.env --perms 0600
-pct exec "$CTID" -- env ACME_EMAIL="$ACME_EMAIL" /root/setup.sh
+pct push "$CTID" "$tmp/origin.pem" /root/origin.pem --perms 0644
+pct push "$CTID" "$tmp/origin.key" /root/origin.key --perms 0600
+pct exec "$CTID" -- /root/setup.sh
 
 ct_ip="$(pct exec "$CTID" -- hostname -I | awk '{print $1}')"
 cat <<EOF
 
 ==> Done. Container $CTID is at $ct_ip
 
-Next steps:
-  1. Forward TCP 443 on your router to $ct_ip.
-  2. In Cloudflare: proxied DNS records, SSL mode "Full (strict)",
-     and Authenticated Origin Pulls turned on.
-  3. Add sites:
+${bold}Finish setup:${reset}
+  1. Router: forward TCP 443 to $ct_ip (port 80 isn't needed).
+  2. Cloudflare dashboard, for your domain:
+     - DNS: an A record per hostname (or "*") pointing at your public IP, Proxied (orange cloud)
+     - SSL/TLS -> Overview: encryption mode "Full (strict)"
+     - SSL/TLS -> Origin Server: turn on "Authenticated Origin Pulls"
+       (until you do, the proxy rejects every request)
+  3. Add sites (hostnames must be covered by the certificate: $cert_hosts):
        pct exec $CTID -- proxy-site add app.example.com 192.168.1.50:8080
        pct exec $CTID -- proxy-site list
 EOF

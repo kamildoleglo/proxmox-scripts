@@ -19,12 +19,16 @@ EOF
 
 die() { echo "error: $*" >&2; exit 1; }
 
+cert_hosts() {
+    openssl x509 -in /etc/caddy/origin.pem -noout -ext subjectAltName \
+        | grep -o 'DNS:[^,]*' | cut -d: -f2 | paste -sd' '
+}
+
 # Validates the whole config and reloads Caddy; on failure restores $1 from $1.bak
 # (or removes $1 if there was no backup).
 apply() {
     local file=$1 out
-    # shellcheck source=/dev/null
-    if ! out="$(set -a; . /etc/caddy/caddy.env; caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile 2>&1)"; then
+    if ! out="$(caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile 2>&1)"; then
         if [[ -f $file.bak ]]; then mv "$file.bak" "$file"; else rm -f "$file"; fi
         echo "$out" | tail -n 3 >&2
         die "invalid config, change rolled back"
@@ -42,6 +46,9 @@ cmd_add() {
     [[ $backend =~ $backend_re ]] || die "invalid backend: $backend"
     [[ -z $insecure || ($insecure == --insecure && $backend == https://*) ]] \
         || die "--insecure only applies to https:// backends"
+    # Cloudflare refuses to connect (error 526) if the certificate doesn't cover the host.
+    [[ "$(openssl x509 -in /etc/caddy/origin.pem -noout -checkhost "$host")" == *"does match"* ]] \
+        || die "$host isn't covered by the Origin certificate ($(cert_hosts))"
 
     file="$SITES/$host.caddy"
     [[ -f $file ]] && cp "$file" "$file.bak"
@@ -49,11 +56,14 @@ cmd_add() {
         echo "# Managed by proxy-site"
         echo "$host {"
         echo "	import cloudflare_only"
+        echo "	reverse_proxy $backend {"
+        # {client_ip} is the visitor's IP (from CF-Connecting-IP), not Cloudflare's.
+        echo "		header_up X-Forwarded-For {client_ip}"
+        echo "		header_up X-Real-IP {client_ip}"
         if [[ -n $insecure ]]; then
-            printf '\treverse_proxy %s {\n\t\ttransport http {\n\t\t\ttls_insecure_skip_verify\n\t\t}\n\t}\n' "$backend"
-        else
-            echo "	reverse_proxy $backend"
+            printf '\t\ttransport http {\n\t\t\ttls_insecure_skip_verify\n\t\t}\n'
         fi
+        echo "	}"
         echo "}"
     } > "$file"
     apply "$file"

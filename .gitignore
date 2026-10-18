@@ -1,1 +1,3 @@
-caddy.env
+# Keep certificates and private keys out of the repo
+*.pem
+*.key

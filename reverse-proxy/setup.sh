@@ -106,6 +106,13 @@ cat > /etc/caddy/Caddyfile <<'EOF'
 }
 
 import /etc/caddy/sites/*.caddy
+
+# Hostnames without a site (e.g. reached through a wildcard DNS record) get a
+# clear 404 instead of a blank page.
+:443 {
+	import cloudflare_only
+	respond "No site is configured for {host}" 404
+}
 EOF
 
 systemctl restart caddy

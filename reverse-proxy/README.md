@@ -43,8 +43,10 @@ Then:
 
 1. **Router:** forward TCP 443 to the container. Port 80 isn't needed.
 2. **Cloudflare dashboard** for the zone:
-   - DNS: an `A` record per hostname (or a `*` wildcard) pointing at your public IP,
-     **Proxied** (orange cloud).
+   - DNS: an `A` record pointing at your public IP, **Proxied** (orange cloud). Easiest
+     is one wildcard record named `*`, plus one for the bare domain if you use it.
+     Then adding a site is only `proxy-site add`, and subdomains without a site get a
+     404. Records for specific names take precedence over the wildcard.
    - *SSL/TLS → Overview*: encryption mode **Full (strict)**.
    - *SSL/TLS → Origin Server*: turn on **Authenticated Origin Pulls**. Caddy rejects
      requests without Cloudflare's client certificate, so every site needs this.

@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Installed on the Proxmox host as /usr/local/sbin/pve-host-backup, run nightly by a
+# timer. Backs up the host's own configuration, which vzdump doesn't cover:
+#   - /etc/pve via the cluster database (storages incl. NFS/SMB credentials, backup
+#     jobs, users, firewall, guest configs) plus a readable copy of the files
+#   - the rest of /etc (fstab, mount units, credential files, network, subuid/subgid)
+#   - /root, /usr/local and crontabs
+#   - a snapshot of the system state (packages, disks, mounts, PCI devices) in info/
+#
+# Writes to a Proxmox storage that holds backups (STORAGE in /etc/default/pve-host-backup):
+#   - directory, NFS, CIFS, ...: pve-host-<hostname>-<time>.tar.zst next to the vzdump files
+#   - Proxmox Backup Server: a "host/<hostname>" backup group
+# and keeps the newest KEEP backups.
+set -euo pipefail
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+CONFIG=/etc/default/pve-host-backup
+# shellcheck source=/dev/null
+[[ -r $CONFIG ]] && . "$CONFIG"
+STORAGE="${STORAGE:-}"
+KEEP="${KEEP:-14}"
+
+die() { echo "error: $*" >&2; exit 1; }
+log() { echo "==> $*"; }
+
+[[ $EUID -eq 0 ]] || die "run as root"
+[[ -n $STORAGE ]] || die "STORAGE is not set in $CONFIG"
+[[ $KEEP =~ ^[1-9][0-9]*$ ]] || die "KEEP must be a positive number, got '$KEEP'"
+command -v sqlite3 >/dev/null || die "sqlite3 is missing (apt install sqlite3)"
+
+host="$(hostname)"
+stamp="$(date +%Y_%m_%d-%H_%M_%S)"
+umask 077
+stage="$(mktemp -d)"
+trap 'rm -rf "$stage"' EXIT
+meta="$stage/pve-host-backup"
+mkdir -p "$meta/info"
+
+# --- Storage -----------------------------------------------------------------
+declare -A S=()
+while IFS='=' read -r k v; do
+    S[$k]=$v
+done < <(perl -MPVE::Storage -e '
+    my $s = PVE::Storage::config()->{ids}{$ARGV[0]} or exit;
+    print "$_=$s->{$_}\n" for grep { !ref $s->{$_} } sort keys %$s;
+' "$STORAGE")
+[[ -n ${S[type]:-} ]] || die "storage '$STORAGE' doesn't exist (see pvesm status)"
+[[ -z ${S[disable]:-} ]] || die "storage '$STORAGE' is disabled"
+
+# --- Collect -----------------------------------------------------------------
+log "Collecting host configuration"
+# /etc/pve is a view of this database; a restore copies it back in one step.
+sqlite3 /var/lib/pve-cluster/config.db ".backup '$meta/config.db'"
+
+# info NAME CMD... - saves a command's output for reference when rebuilding.
+info() { local name=$1; shift; "$@" > "$meta/info/$name" 2>&1 || true; }
+info hostname hostname -f
+info pveversion pveversion -v
+info packages-manual apt-mark showmanual
+info packages-all dpkg --get-selections
+info lsblk lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINTS
+info blkid blkid
+info findmnt findmnt -l
+info ip-addr ip -d addr
+info ip-route ip route
+info pvesm-status pvesm status
+info lspci lspci -nnk
+info zpool zpool status
+info lvm lvs -a
+info units-enabled systemctl list-unit-files --state=enabled
+info crontab crontab -l
+
+cat > "$meta/RESTORE.txt" <<EOF
+Proxmox host configuration of $host, taken $(date -R).
+Restore steps: https://github.com/kamildoleglo/proxmox-scripts/tree/main/host-backup#restore
+EOF
+
+# Paths relative to /. /etc/pve is a separate filesystem, so it's listed explicitly
+# (tar would include it anyway, the PBS client wouldn't).
+paths=()
+for p in etc etc/pve root usr/local var/spool/cron; do
+    [[ -e /$p ]] && paths+=("$p")
+done
+
+# --- Write -------------------------------------------------------------------
+backup_dir() {
+    local dir out rc=0
+    dir="$(perl -MPVE::Storage -e '
+        my $cfg = PVE::Storage::config();
+        PVE::Storage::activate_storage($cfg, $ARGV[0]);
+        print PVE::Storage::get_backup_dir($cfg, $ARGV[0]);
+    ' "$STORAGE")" || die "can't use storage '$STORAGE' for backups"
+    out="$dir/pve-host-$host-$stamp.tar.zst"
+
+    log "Writing $out"
+    # etc/pve is already inside etc, so it's left off the list here.
+    local p tar_paths=()
+    for p in "${paths[@]}"; do [[ $p == etc/pve ]] || tar_paths+=("$p"); done
+    tar --zstd -cf "$out.tmp" --warning=no-file-changed --exclude=root/.cache \
+        -C / "${tar_paths[@]}" -C "$stage" pve-host-backup || rc=$?
+    # 1 means a file changed while being read, which is fine for a nightly backup.
+    if (( rc > 1 )); then rm -f "$out.tmp"; die "tar failed"; fi
+    mv "$out.tmp" "$out"
+
+    local old
+    sort -r < <(printf '%s\n' "$dir/pve-host-$host-"*.tar.zst) | tail -n +"$((KEEP + 1))" \
+        | while read -r old; do log "Removing $old"; rm -f -- "$old"; done
+}
+
+backup_pbs() {
+    local server=${S[server]} id=$STORAGE priv=/etc/pve/priv/storage
+    [[ $server == *:* ]] && server="[$server]"    # IPv6
+    export PBS_REPOSITORY="${S[username]}@$server:${S[port]:-8007}:${S[datastore]}"
+    PBS_PASSWORD="$(< "$priv/$id.pw")" || die "no password for storage '$id'"
+    export PBS_PASSWORD
+    [[ -n ${S[fingerprint]:-} ]] && export PBS_FINGERPRINT=${S[fingerprint]}
+
+    local ns=() crypt=() archives=() p name
+    [[ -n ${S[namespace]:-} ]] && ns=(--ns "${S[namespace]}")
+    # Same client-side encryption as the guest backups, if the storage uses it.
+    [[ -f $priv/$id.enc ]] && crypt+=(--keyfile "$priv/$id.enc")
+    [[ -f $priv/$id.master.pem ]] && crypt+=(--master-pubkey-file "$priv/$id.master.pem")
+    for p in "${paths[@]}"; do
+        name=${p//\//-}
+        archives+=("$name.pxar:/$p")
+    done
+
+    log "Uploading to $PBS_REPOSITORY as host/$host"
+    proxmox-backup-client backup "${archives[@]}" meta.pxar:"$meta" \
+        --backup-type host --backup-id "$host" "${ns[@]}" "${crypt[@]}"
+
+    proxmox-backup-client prune "host/$host" --keep-last "$KEEP" --quiet "${ns[@]}" \
+        || echo "warning: pruning old backups failed; old ones stay until a PBS prune job removes them" >&2
+}
+
+case ${S[type]} in
+    pbs) backup_pbs ;;
+    *)   backup_dir ;;
+esac
+log "Done"

@@ -6,6 +6,7 @@ One-command installers for Proxmox VE, in the style of
 | Script | What it creates |
 |---|---|
 | [reverse-proxy](reverse-proxy/) | Caddy reverse proxy LXC that routes by hostname, behind Cloudflare |
+| [host-backup](host-backup/) | Nightly backup of the host's own configuration (`/etc/pve`, mounts, network), for rebuilding after a disk failure |
 
 ## Reverse proxy
 
@@ -14,3 +15,11 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/kamildoleglo/proxmox-scr
 ```
 
 Details in [reverse-proxy/README.md](reverse-proxy/README.md).
+
+## Host configuration backup
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/kamildoleglo/proxmox-scripts/main/host-backup/install.sh)"
+```
+
+Details and restore steps in [host-backup/README.md](host-backup/README.md).

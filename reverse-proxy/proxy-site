@@ -9,7 +9,8 @@ usage() {
     cat <<'EOF'
 Usage:
   proxy-site add <hostname> <backend> [--insecure]
-      backend: IP:port, or https://IP:port for a backend serving HTTPS.
+      backend: IP:port, or https://IP:port for a backend serving HTTPS (it is sent
+      <hostname> as SNI, so it can pick the right certificate).
       --insecure skips verifying the backend's certificate (self-signed, e.g. Proxmox UI).
   proxy-site rm <hostname>
   proxy-site list
@@ -60,8 +61,13 @@ cmd_add() {
         # {client_ip} is the visitor's IP (from CF-Connecting-IP), not Cloudflare's.
         echo "		header_up X-Forwarded-For {client_ip}"
         echo "		header_up X-Real-IP {client_ip}"
-        if [[ -n $insecure ]]; then
-            printf '\t\ttransport http {\n\t\t\ttls_insecure_skip_verify\n\t\t}\n'
+        if [[ $backend == https://* ]]; then
+            echo "		transport http {"
+            # Ask for the public hostname's certificate. Without SNI, a backend
+            # that serves several hosts (Caddy, nginx, ...) has none to offer.
+            echo "			tls_server_name $host"
+            if [[ -n $insecure ]]; then echo "			tls_insecure_skip_verify"; fi
+            echo "		}"
         fi
         echo "	}"
         echo "}"

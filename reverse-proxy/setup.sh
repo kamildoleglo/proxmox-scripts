@@ -7,6 +7,10 @@ export DEBIAN_FRONTEND=noninteractive
 # pct exec passes on the host's locale (e.g. en_US.UTF-8), which the template
 # lacks; C.UTF-8 is always available and keeps perl/apt from warning.
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
+# Skip rebuilding the man page index after every install; it's slow on a small
+# container and nobody reads man pages here.
+echo 'man-db man-db/auto-update boolean false' | debconf-set-selections
+rm -f /var/lib/man-db/auto-update
 
 apt-get update
 apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gpg nftables openssl

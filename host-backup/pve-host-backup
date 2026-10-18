@@ -4,7 +4,7 @@
 #   - /etc/pve via the cluster database (storages incl. NFS/SMB credentials, backup
 #     jobs, users, firewall, guest configs) plus a readable copy of the files
 #   - the rest of /etc (fstab, mount units, credential files, network, subuid/subgid)
-#   - /root, /usr/local and crontabs
+#   - /root, /usr/local, crontabs and apt repository keys
 #   - a snapshot of the system state (packages, disks, mounts, PCI devices) in info/
 #
 # Writes to a Proxmox storage that holds backups (STORAGE in /etc/default/pve-host-backup):
@@ -76,9 +76,10 @@ Restore steps: https://github.com/kamildoleglo/proxmox-scripts/tree/main/host-ba
 EOF
 
 # Paths relative to /. /etc/pve is a separate filesystem, so it's listed explicitly
-# (tar would include it anyway, the PBS client wouldn't).
+# (tar would include it anyway, the PBS client wouldn't). usr/share/keyrings holds
+# the signing keys of third-party apt repositories.
 paths=()
-for p in etc etc/pve root usr/local var/spool/cron; do
+for p in etc etc/pve root usr/local var/spool/cron usr/share/keyrings; do
     [[ -e /$p ]] && paths+=("$p")
 done
 

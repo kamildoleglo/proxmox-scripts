@@ -73,6 +73,8 @@ curl -fsSL https://developers.cloudflare.com/ssl/static/authenticated_origin_pul
 chmod 0644 /etc/caddy/cloudflare-origin-pull-ca.pem
 
 install -m 0755 /root/proxy-site /usr/local/sbin/proxy-site
+# `pct exec` runs with PATH=/sbin:/bin:/usr/sbin:/usr/bin, which skips /usr/local.
+ln -sf /usr/local/sbin/proxy-site /usr/sbin/proxy-site
 mkdir -p /etc/caddy/sites
 
 # Global settings only; each site is a file in /etc/caddy/sites/ (see proxy-site).

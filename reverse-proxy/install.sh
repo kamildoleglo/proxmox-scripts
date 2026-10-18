@@ -140,8 +140,15 @@ pct create "$CTID" "$TEMPLATE_STORAGE:vztmpl/$TEMPLATE" \
     --unprivileged 1 \
     --features nesting=1 \
     --onboot 1 \
-    --start 1 \
     "${extra[@]}"
+
+# Started separately: `pct create --start` exits 0 even when the start fails.
+log "Starting container $CTID"
+if ! pct start "$CTID" || [[ "$(pct status "$CTID")" != *running* ]]; then
+    die "container $CTID failed to start.
+  See why with:  pct start $CTID --debug
+  Remove it with: pct destroy $CTID"
+fi
 
 log "Waiting for network"
 for _ in {1..30}; do

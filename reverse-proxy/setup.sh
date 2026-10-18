@@ -4,6 +4,9 @@
 # Expects origin.pem, origin.key and the scripts pushed to /root by install.sh.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+# pct exec passes on the host's locale (e.g. en_US.UTF-8), which the template
+# lacks; C.UTF-8 is always available and keeps perl/apt from warning.
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
 apt-get update
 apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gpg nftables openssl

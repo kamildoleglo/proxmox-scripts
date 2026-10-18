@@ -42,7 +42,9 @@ EOF
         "$(tr '\n' ' ' <<<"$v4 $v6")" > "$CADDY_SNIPPET.new"
     if ! cmp -s "$CADDY_SNIPPET.new" "$CADDY_SNIPPET"; then
         mv "$CADDY_SNIPPET.new" "$CADDY_SNIPPET"
-        systemctl try-reload-or-restart caddy
+        # --no-block: caddy.service is ordered after this unit, so waiting for the
+        # reload here would deadlock. It runs as soon as this script exits.
+        systemctl --no-block try-reload-or-restart caddy
     else
         rm -f "$CADDY_SNIPPET.new"
     fi

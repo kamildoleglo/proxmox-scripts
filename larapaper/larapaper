@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Manages the LaraPaper compose project in /opt/larapaper.
+set -euo pipefail
+
+APP_DIR=/opt/larapaper
+
+usage() {
+    cat <<'EOF'
+Usage:
+  larapaper update [VERSION]        update to VERSION (e.g. 0.45.0), default the latest release
+  larapaper registration on|off     allow or block signing up in the web UI
+  larapaper status                  version, container state and URL
+  larapaper logs                    follow the app's logs
+EOF
+    exit "${1:-0}"
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# set_var FILE KEY VALUE - replaces KEY=... in FILE, or appends it.
+set_var() {
+    local file=$1 key=$2 value=$3
+    if grep -q "^$key=" "$file"; then
+        sed -i "s|^$key=.*|$key=$value|" "$file"
+    else
+        echo "$key=$value" >> "$file"
+    fi
+}
+
+get_var() { grep -oP "^$2=\K.*" "$1" || true; }
+
+cmd_update() {
+    [[ $# -le 1 ]] || usage 1
+    local version=${1:-} current
+    if [[ -z $version ]]; then
+        version="$(curl -fsSL https://api.github.com/repos/usetrmnl/larapaper/releases/latest \
+            | grep -oP '"tag_name":\s*"\K[^"]+' || true)"
+        [[ -n $version ]] || die "couldn't look up the latest release; pass a VERSION"
+    fi
+    version=${version#v}
+    [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid version: $version"
+    current="$(get_var .env LARAPAPER_VERSION)"
+
+    # Pull first, so a missing tag leaves the running version alone.
+    LARAPAPER_VERSION=$version docker compose pull --quiet \
+        || die "couldn't pull LaraPaper $version"
+    set_var .env LARAPAPER_VERSION "$version"
+    docker compose up -d
+    docker image prune -f >/dev/null
+    if [[ $current == "$version" ]]; then
+        echo "LaraPaper is at $version"
+    else
+        echo "LaraPaper updated: $current -> $version"
+    fi
+}
+
+cmd_registration() {
+    [[ $# -eq 1 ]] || usage 1
+    case $1 in
+        on) set_var larapaper.env REGISTRATION_ENABLED 1 ;;
+        off) set_var larapaper.env REGISTRATION_ENABLED 0 ;;
+        *) usage 1 ;;
+    esac
+    # Recreates the container with the new environment.
+    docker compose up -d
+    echo "Registration is $1"
+}
+
+cmd_status() {
+    echo "Version:      $(get_var .env LARAPAPER_VERSION)"
+    echo "URL:          $(get_var larapaper.env APP_URL)"
+    echo "Registration: $([[ $(get_var larapaper.env REGISTRATION_ENABLED) == 1 ]] && echo on || echo off)"
+    docker compose ps
+}
+
+[[ $EUID -eq 0 ]] || die "run as root"
+cd "$APP_DIR"
+case ${1:-} in
+    update) shift; cmd_update "$@" ;;
+    registration) shift; cmd_registration "$@" ;;
+    status) cmd_status ;;
+    logs) docker compose logs -f --tail 100 ;;
+    -h|--help|help) usage ;;
+    *) usage 1 ;;
+esac

@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+"""es60w-scand: scan button on an Epson ES-60W (Wi-Fi) -> PDF in a folder.
+
+Installed into a container by install.sh next to this file; see README.md.
+
+Holds a session with the scanner on TCP 1865 ("IS" frames + ESC/I-2, the same
+protocol SANE epsonds and Epson Scan use). When the physical scan button is
+pressed the scanner notifies the session holder; the daemon then scans every
+sheet in the feeder and writes one PDF into OUTPUT_DIR.
+
+The scanner serves a single TCP connection and treats every connection as a
+session attempt, so nothing else should connect to port 1865 (port scanners,
+uptime monitors): stray connections can wedge it until it is power-cycled.
+
+File safety: the PDF is written as "<name>.pdf.part" (ignored by Paperless) and
+renamed to a name that does not exist yet ("_2", "_3", ... appended if needed).
+Nothing in OUTPUT_DIR is ever deleted or overwritten, except our own .part file
+if a scan fails half-way.
+
+Configuration via environment variables (all optional except OUTPUT_DIR):
+  SCANNER_HOST   IP/hostname tried first; updated from mDNS (default: none)
+  SCANNER_MAC    used to recognise the scanner's mDNS announcements; while the
+                 scanner is off the daemon waits for one (connects ~3 s after
+                 it appears, retries every 5 min regardless). Without it: 30 s
+                 polling. (e.g. aa:bb:cc:dd:ee:ff)
+  OUTPUT_DIR     target folder (Paperless consume dir)
+  FALLBACK_DIR   used if OUTPUT_DIR is unwritable (default /var/lib/es60w-scand/unsent)
+  SCAN_DPI       200/300/400/600                   (default 300)
+  SCAN_COLOR     C024 colour, M008 grey, M001 b&w  (default C024)
+  SCAN_JPEG_Q    JPEG quality 1-100                (default 85)
+  SCAN_MAX_IN    max page length in inches          (default 14, scanner max 72)
+  SCAN_TONE      1 = levels curve applied by the scanner (default 1)
+  SCAN_BLACK     input level mapped to black         (default 35)
+  SCAN_WHITE     input level mapped to white         (default 225)
+  SCAN_GAMMA     midtone curve, >1 = darker text     (default 1.15)
+  SCAN_SHARPEN   unsharp mask "radius,percent,threshold" via Pillow, 0 = off
+                 (default 1.2,80,3; skipped if Pillow is missing)
+  LOG_LEVEL      DEBUG/INFO                         (default INFO)
+
+Python 3.9+, standard library only.
+"""
+import io
+import logging
+import os
+import re
+import select
+import signal
+import socket
+import struct
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+log = logging.getLogger("es60w")
+
+PORT = 1865
+GREETING, NOTIFY, KEEPALIVE = 0x8000, 0x9000, 0x1000
+DATA, DATA_ACK = 0x2000, 0xA000
+LOCK, LOCK_ACK, UNLOCK, UNLOCK_ACK = 0x2100, 0xA100, 0x2101, 0xA101
+LOCK_PAYLOAD = bytes.fromhex("01a0040000012c")
+NOTIFY_BUTTON, NOTIFY_POWER_OFF, NOTIFY_SESSION_END = 0x01, 0x02, 0x80
+KEEPALIVE_S = 60
+FEEDER_WIDTH_IN = 8.5          # ADFAREA i0000850 (hundredths of an inch)
+IMG_EMPTY_TIMEOUT_S = 60
+
+
+class ScanError(RuntimeError):
+    pass
+
+
+class SessionEnded(RuntimeError):
+    pass
+
+
+class PoweredOff(SessionEnded):
+    """Scanner sent notification 0x02 right before switching off."""
+
+
+class Unreachable(OSError):
+    """TCP connect to the scanner failed (off, asleep, wrong IP)."""
+
+
+class Busy(ConnectionError):
+    """Scanner answered but refused the session lock."""
+
+
+# --------------------------------------------------------------------------
+# wire layer
+# --------------------------------------------------------------------------
+class Link:
+    def __init__(self, sock):
+        self.sock = sock
+        self.pending = []  # notifications that arrived mid-transaction
+
+    def _exact(self, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("scanner closed the connection")
+            buf += chunk
+        return bytes(buf)
+
+    def recv(self):
+        hdr = self._exact(12)
+        if hdr[:2] != b"IS":
+            raise ConnectionError(f"bad frame header {hdr.hex()}")
+        ptype, _d, _h, length, _ = struct.unpack(">HBBIH", hdr[2:])
+        return ptype, self._exact(length)
+
+    def send(self, ptype, payload=b""):
+        self.sock.sendall(b"IS" + struct.pack(">HBBIH", ptype, 0, 12, len(payload), 0) + payload)
+
+    def expect(self, ptype):
+        while True:
+            t, pl = self.recv()
+            if t == NOTIFY:
+                self.pending.append(pl[0] if pl else -1)
+                continue
+            if t != ptype:
+                raise ConnectionError(f"expected {ptype:#06x}, got {t:#06x}")
+            return pl
+
+    def transact(self, data, reply_len):
+        self.send(DATA, struct.pack(">II", len(data), reply_len) + data)
+        pl = self.expect(DATA_ACK)
+        if len(pl) != reply_len:
+            raise ConnectionError(f"reply length {len(pl)} != {reply_len}")
+        return pl
+
+    def cmd(self, name, params=b""):
+        """One ESC/I-2 command; returns (tokens, data). Retries while BUSY."""
+        deadline = time.monotonic() + 15
+        while True:
+            if params:
+                self.transact(name + b"x%07X" % len(params), 0)
+                hdr = self.transact(params, 64)
+            else:
+                hdr = self.transact(name + b"x0000000", 64)
+            if hdr[:4] != name or hdr[4:5] != b"x":
+                raise ConnectionError(f"reply to {name!r} is {hdr[:12]!r}")
+            size = int(hdr[5:12], 16)
+            data = self.transact(b"", size) if size else b""
+            tokens = hdr[12:].rstrip(b"\x00").split(b"#---")[0]
+            if b"#nrdBUSY" not in tokens or time.monotonic() > deadline:
+                return tokens, data
+            time.sleep(0.2)
+
+    def mode_fs_x(self):
+        if self.transact(b"\x1cX", 1) != b"\x06":
+            raise ConnectionError("no ACK on FS X")
+
+    def open(self):
+        t, pl = self.recv()
+        if t != GREETING:
+            raise ConnectionError(f"no greeting, got {t:#06x}")
+        log.debug("greeting %s", pl.hex(" "))
+        self.send(LOCK, LOCK_PAYLOAD)
+        while True:
+            t, pl = self.recv()
+            if t != NOTIFY:
+                break
+        if t != LOCK_ACK or pl != b"\x06":
+            raise Busy(f"scanner refused the session ({t:#06x} {pl.hex(' ')}); "
+                       "another app or a stale session holds it")
+        self.locked = True
+
+    def close(self):
+        """FIN + unlock if we hold the lock; never send commands otherwise."""
+        if not getattr(self, "locked", False):
+            return
+        try:
+            self.sock.settimeout(3)
+            self.cmd(b"FIN ")
+            self.send(UNLOCK)
+            self.expect(UNLOCK_ACK)
+            log.debug("session unlocked")
+        except Exception as exc:  # noqa: BLE001 - best effort
+            log.info("could not release the session cleanly: %s", exc)
+        self.locked = False
+
+
+def tokens_dict(tokens):
+    out = {}
+    for part in tokens.split(b"#"):
+        part = part.strip(b"\x00")
+        if len(part) >= 3:
+            out[part[:3].decode("latin-1")] = part[3:]
+    return out
+
+
+def token_value(data, name):
+    m = re.search(rb"#" + name + rb"h([0-9A-F]{3})", data)
+    if not m:
+        return "?"
+    n = int(m.group(1), 16)
+    return data[m.end():m.end() + n].decode("latin-1").strip()
+
+
+def dims(value):
+    nums = [int(x) for x in value.split(b"i") if x]
+    return nums[0], nums[-1]
+
+
+# --------------------------------------------------------------------------
+# scanning
+# --------------------------------------------------------------------------
+def finish_jpeg(data, height):
+    """Cut padding after the last EOI and patch the real height into SOF."""
+    eoi = data.rfind(b"\xff\xd9")
+    data = bytearray(data[:eoi + 2] if eoi >= 0 else data + b"\xff\xd9")
+    i = 2
+    while i + 4 < len(data) and data[i] == 0xFF:
+        marker, seglen = data[i + 1], int.from_bytes(data[i + 2:i + 4], "big")
+        if marker in (0xC0, 0xC1, 0xC2):
+            data[i + 5:i + 7] = height.to_bytes(2, "big")
+            break
+        i += 2 + seglen
+    return bytes(data)
+
+
+def jpeg_components(jpeg):
+    i = 2
+    while i + 4 < len(jpeg) and jpeg[i] == 0xFF:
+        marker, seglen = jpeg[i + 1], int.from_bytes(jpeg[i + 2:i + 4], "big")
+        if marker in (0xC0, 0xC1, 0xC2):
+            return jpeg[i + 9]
+        i += 2 + seglen
+    return 3
+
+
+def tone_table(black, white, gamma):
+    """256-entry levels curve: <=black -> 0, >=white -> 255, gamma on the rest
+    (gamma > 1 darkens midtones, i.e. crisper text)."""
+    out = bytearray(256)
+    for v in range(256):
+        x = min(1.0, max(0.0, (v - black) / float(white - black)))
+        out[v] = round(255 * x ** gamma)
+    return bytes(out)
+
+
+def gamma_tables(cfg):
+    """#GMT tables, applied by the scanner itself (Epson Scan sends them too)."""
+    if not cfg["tone"]:
+        return b""
+    table = tone_table(cfg["black"], cfg["white"], cfg["gamma"])
+    names = [b"MONO"] if cfg["color"].startswith("M") else [b"RED ", b"GRN ", b"BLU "]
+    return b"".join(b"#GMT" + n + b"h100" + table for n in names)
+
+
+def para_block(cfg):
+    w = round(FEEDER_WIDTH_IN * cfg["dpi"])
+    h = round(cfg["max_in"] * cfg["dpi"])
+    return b"".join([
+        b"#ADF",
+        b"#COL" + cfg["color"].encode(),
+        b"#THRd110" if cfg["color"] == "M001" else b"",
+        b"#FMTJPG ",
+        b"#JPGd%03d" % cfg["jpeg_q"],
+        b"#GMMUG18",
+        gamma_tables(cfg),
+        b"#CMXUNIT",
+        b"#RSMi%07d" % cfg["dpi"],
+        b"#RSSi%07d" % cfg["dpi"],
+        b"#ACQi%07di%07di%07di%07d" % (0, 0, w, h),
+        b"#BSZi%07d" % 1048576,
+        b"#PAGd000",
+    ])
+
+
+def run_scan(link, cfg):
+    """Scan all sheets in the feeder; returns [(jpeg, width, height), ...]."""
+    tokens, _ = link.cmd(b"PARA", b"#ADF")
+    if b"parOK" not in tokens:
+        raise ScanError(f"PARA #ADF refused: {tokens!r}")
+    link.cmd(b"STAT")
+    tokens, _ = link.cmd(b"PARA", para_block(cfg))
+    if b"parOK" not in tokens:
+        raise ScanError(f"PARA refused: {tokens!r}")
+    link.cmd(b"TRDT")
+
+    pages, current, last_data = [], None, time.monotonic()
+    while True:
+        tokens, data = link.cmd(b"IMG ")
+        tok = tokens_dict(tokens)
+        if "err" in tok:
+            err = tok["err"].decode("latin-1").strip()
+            if err == "ADF PE":
+                break
+            raise ScanError(f"scanner error: {err}")
+        if "pst" in tok:
+            current = {"w": dims(tok["pst"])[0], "h": dims(tok["pst"])[1], "chunks": []}
+        if data:
+            if current is None:
+                raise ScanError("image data without page start")
+            current["chunks"].append(data)
+            last_data = time.monotonic()
+        if "pen" in tok and current is not None:
+            current["w"], current["h"] = dims(tok["pen"])
+            jpeg = finish_jpeg(b"".join(current["chunks"]), current["h"])
+            pages.append((jpeg, current["w"], current["h"]))
+            log.info("page %d: %dx%d px, %d KB", len(pages), current["w"], current["h"], len(jpeg) // 1024)
+            current = None
+        if not data and "pen" not in tok and "pst" not in tok:
+            if time.monotonic() - last_data > IMG_EMPTY_TIMEOUT_S:
+                raise ScanError("scanner stopped sending data")
+            time.sleep(0.05)
+    link.cmd(b"STAT")
+    if current is not None:
+        log.warning("discarded an incomplete last page")
+    return pages
+
+
+def sharpen_pages(pages, cfg):
+    """Optional unsharp mask via Pillow; pages unchanged if Pillow is missing."""
+    if not cfg["sharpen"]:
+        return pages
+    try:
+        from PIL import Image, ImageFilter
+    except ImportError:
+        log.warning("SCAN_SHARPEN is on but Pillow is not installed; skipping")
+        return pages
+    radius, percent, threshold = cfg["sharpen"]
+    out = []
+    for jpeg, w, h in pages:
+        img = Image.open(io.BytesIO(jpeg))
+        img = img.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=threshold))
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=cfg["jpeg_q"], dpi=(cfg["dpi"], cfg["dpi"]), optimize=True)
+        out.append((buf.getvalue(), img.width, img.height))
+    return out
+
+
+# --------------------------------------------------------------------------
+# output
+# --------------------------------------------------------------------------
+def build_pdf(pages, dpi):
+    out = io.BytesIO()
+    offsets = []
+
+    def obj(body, stream=None):
+        offsets.append(out.tell())
+        out.write(b"%d 0 obj\n" % len(offsets) + body)
+        if stream is not None:
+            out.write(b"\nstream\n" + stream + b"\nendstream")
+        out.write(b"\nendobj\n")
+
+    out.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    page_ids = [3 + 3 * i for i in range(len(pages))]
+    obj(b"<< /Type /Catalog /Pages 2 0 R >>")
+    obj(b"<< /Type /Pages /Kids [%s] /Count %d >>"
+        % (b" ".join(b"%d 0 R" % p for p in page_ids), len(pages)))
+    for pid, (jpeg, w, h) in zip(page_ids, pages):
+        pw, ph = w * 72 / dpi, h * 72 / dpi
+        cs = b"/DeviceGray" if jpeg_components(jpeg) == 1 else b"/DeviceRGB"
+        content = b"q %.2f 0 0 %.2f 0 0 cm /Im0 Do Q" % (pw, ph)
+        obj(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %.2f %.2f] "
+            b"/Resources << /XObject << /Im0 %d 0 R >> >> /Contents %d 0 R >>"
+            % (pw, ph, pid + 1, pid + 2))
+        obj(b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace %s "
+            b"/BitsPerComponent 8 /Filter /DCTDecode /Length %d >>" % (w, h, cs, len(jpeg)), jpeg)
+        obj(b"<< /Length %d >>" % len(content), content)
+    xref = out.tell()
+    out.write(b"xref\n0 %d\n0000000000 65535 f \n" % (len(offsets) + 1))
+    for off in offsets:
+        out.write(b"%010d 00000 n \n" % off)
+    out.write(b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+              % (len(offsets) + 1, xref))
+    return out.getvalue()
+
+
+def save_pdf(output_dir, pdf_bytes):
+    """Write <name>.pdf.part, then rename to the first free es60w_<ts>[_n].pdf.
+    Never overwrites or deletes anything that is not our own .part file."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    part = output_dir / f"es60w_{stamp}_{os.getpid()}.pdf.part"
+    with open(part, "xb") as fh:  # 'x': fail rather than overwrite
+        fh.write(pdf_bytes)
+        fh.flush()
+        os.fsync(fh.fileno())
+    n = 1
+    while True:
+        target = output_dir / (f"es60w_{stamp}.pdf" if n == 1 else f"es60w_{stamp}_{n}.pdf")
+        if not target.exists() and not os.path.lexists(target):
+            os.rename(part, target)
+            return target
+        n += 1
+        if n > 999:
+            raise ScanError(f"no free file name for {stamp}; left {part.name}")
+
+
+# --------------------------------------------------------------------------
+# discovery + session loop
+# --------------------------------------------------------------------------
+# The scanner serves one TCP connection at a time and treats every connection
+# as a session attempt, so port 1865 is ONLY ever opened for a real session.
+# While it is off, we listen for its mDNS (Bonjour) traffic instead: when it
+# joins the network it announces "EPSON ES-60W [<MAC>]._scanner._tcp.local"
+# from its current IP, a few seconds before it accepts sessions.
+MDNS_GROUP, MDNS_PORT = "224.0.0.251", 5353
+FALLBACK_RETRY_S = 300   # retry without an announcement, in case one is missed
+AFTER_ANNOUNCE_S = 3     # let the scanner finish booting before connecting
+
+
+class MdnsWatcher:
+    def __init__(self, mac):
+        self.tag = mac.replace(":", "").upper().encode()  # e.g. b"AABBCCDDEEFF"
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        self.sock.bind(("", MDNS_PORT))
+        mreq = socket.inet_aton(MDNS_GROUP) + socket.inet_aton("0.0.0.0")
+        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        self.sock.setblocking(False)
+
+    def drain(self):
+        try:
+            while self.sock.recv(9000):
+                pass
+        except BlockingIOError:
+            pass
+
+    def wait(self, timeout):
+        """Return the scanner's IP when it shows up in mDNS, or None on timeout."""
+        deadline = time.monotonic() + timeout
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            r, _, _ = select.select([self.sock], [], [], left)
+            if not r:
+                return None
+            try:
+                data, (ip, _port) = self.sock.recvfrom(9000)
+            except BlockingIOError:
+                continue
+            if self.tag in data.upper():
+                return ip
+
+
+def session(cfg, host):
+    try:
+        sock = socket.create_connection((host, PORT), timeout=10)
+    except OSError as exc:
+        raise Unreachable(str(exc)) from exc
+    sock.settimeout(30)
+    if hasattr(socket, "TCP_USER_TIMEOUT"):  # detect a scanner that switched off
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, 90_000)
+    link = Link(sock)
+    try:
+        link.open()
+        link.mode_fs_x()
+        _, info = link.cmd(b"INFO")
+        link.cmd(b"CAPA")
+        link.cmd(b"STAT")
+        log.info("connected to %s at %s, waiting for the scan button", token_value(info, b"PRD"), host)
+        next_ka = time.monotonic() + KEEPALIVE_S
+        while True:
+            while link.pending:
+                handle(link, cfg, link.pending.pop(0))
+            r, _, _ = select.select([sock], [], [], max(0.0, next_ka - time.monotonic()))
+            if r:
+                t, pl = link.recv()
+                if t == NOTIFY:
+                    handle(link, cfg, pl[0] if pl else -1)
+                else:
+                    log.warning("unexpected frame while idle: %#06x", t)
+            if time.monotonic() >= next_ka:
+                link.send(KEEPALIVE)
+                next_ka = time.monotonic() + KEEPALIVE_S
+    finally:
+        link.close()
+        sock.close()
+
+
+def handle(link, cfg, value):
+    if value == NOTIFY_SESSION_END:
+        raise SessionEnded("scanner ended the session")
+    if value == NOTIFY_POWER_OFF:
+        link.locked = False  # it is going away; an unlock would only hit a dead socket
+        raise PoweredOff("scanner is switching off")
+    if value != NOTIFY_BUTTON:
+        log.warning("unknown notification %#04x", value & 0xFF)
+        return
+    log.info("scan button pressed")
+    started = time.monotonic()
+    try:
+        pages = run_scan(link, cfg)
+    except ScanError as exc:
+        log.error("scan failed: %s", exc)
+        return
+    if not pages:
+        log.warning("no pages scanned (feeder empty?)")
+        return
+    try:
+        pages = sharpen_pages(pages, cfg)
+    except Exception as exc:  # noqa: BLE001 - never lose a scan over post-processing
+        log.error("sharpening failed (%s), keeping the unsharpened pages", exc)
+    pdf = build_pdf(pages, cfg["dpi"])
+    try:
+        target = save_pdf(cfg["output_dir"], pdf)
+    except OSError as exc:  # e.g. NAS share down: keep the scan locally
+        log.error("cannot write to %s (%s), saving to %s instead",
+                  cfg["output_dir"], exc, cfg["fallback_dir"])
+        target = save_pdf(cfg["fallback_dir"], pdf)
+    log.info("saved %d page(s) in %.1f s -> %s", len(pages), time.monotonic() - started, target)
+
+
+def _stop(signum, _frame):
+    # Unwind like Ctrl+C so session()'s finally sends FIN + unlock to the
+    # scanner; otherwise it keeps the session reserved until its own timeout.
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+def main():
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGHUP, _stop)
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
+                        format="%(levelname)s %(message)s", stream=sys.stdout)
+    env = os.environ
+    if not env.get("OUTPUT_DIR"):
+        sys.exit("OUTPUT_DIR is required")
+    cfg = {
+        "host": env.get("SCANNER_HOST") or None,
+        "mac": (env.get("SCANNER_MAC") or "").lower() or None,
+        "output_dir": Path(env["OUTPUT_DIR"]),
+        "fallback_dir": Path(env.get("FALLBACK_DIR", "/var/lib/es60w-scand/unsent")),
+        "dpi": int(env.get("SCAN_DPI", "300")),
+        "color": env.get("SCAN_COLOR", "C024"),
+        "jpeg_q": int(env.get("SCAN_JPEG_Q", "85")),
+        "max_in": float(env.get("SCAN_MAX_IN", "14")),
+        "tone": env.get("SCAN_TONE", "1") == "1",
+        "black": int(env.get("SCAN_BLACK", "35")),
+        "white": int(env.get("SCAN_WHITE", "225")),
+        "gamma": float(env.get("SCAN_GAMMA", "1.15")),
+        "sharpen": None,
+    }
+    if env.get("SCAN_SHARPEN", "1.2,80,3") not in ("", "0"):
+        r, p, t = env.get("SCAN_SHARPEN", "1.2,80,3").split(",")
+        cfg["sharpen"] = (float(r), int(p), int(t))
+    if not 0 <= cfg["black"] < cfg["white"] <= 255:
+        sys.exit("need 0 <= SCAN_BLACK < SCAN_WHITE <= 255")
+    if cfg["dpi"] not in (200, 300, 400, 600):
+        sys.exit("SCAN_DPI must be 200, 300, 400 or 600")
+    log.info("es60w-scand: %d dpi %s, tone %s, sharpen %s -> %s", cfg["dpi"], cfg["color"],
+             f"{cfg['black']}-{cfg['white']} g{cfg['gamma']}" if cfg["tone"] else "off",
+             cfg["sharpen"] or "off", cfg["output_dir"])
+    try:
+        run_forever(cfg)
+    except KeyboardInterrupt:
+        log.info("stopping; scanner session released")
+
+
+def wait_for_scanner(cfg, mdns):
+    """Block until the scanner announces itself (or the fallback timer fires)."""
+    if mdns is None:
+        time.sleep(30)
+        return
+    log.info("waiting for the scanner to come online (mDNS)")
+    mdns.drain()
+    ip = mdns.wait(FALLBACK_RETRY_S)
+    if ip is None:
+        log.debug("no announcement within %d s, retrying anyway", FALLBACK_RETRY_S)
+        return
+    if ip != cfg["host"]:
+        log.info("scanner announced itself at %s (was %s)", ip, cfg["host"])
+        cfg["host"] = ip
+    else:
+        log.info("scanner announced itself at %s", ip)
+    time.sleep(AFTER_ANNOUNCE_S)
+
+
+def run_forever(cfg):
+    mdns = None
+    if cfg["mac"]:
+        try:
+            mdns = MdnsWatcher(cfg["mac"])
+        except OSError as exc:
+            log.warning("cannot listen for mDNS (%s); falling back to 30 s polling", exc)
+    backoff = 5
+    while True:
+        if not cfg["host"]:
+            wait_for_scanner(cfg, mdns)
+            continue
+        try:
+            session(cfg, cfg["host"])
+            backoff = 5
+        except PoweredOff as exc:
+            log.info("%s", exc)
+            wait_for_scanner(cfg, mdns)
+        except Unreachable as exc:
+            log.debug("connect failed: %s", exc)
+            wait_for_scanner(cfg, mdns)
+        except Busy as exc:
+            log.info("%s; waiting 30 s", exc)
+            time.sleep(30)
+        except SessionEnded as exc:
+            log.info("%s, reconnecting", exc)
+            time.sleep(2)
+            backoff = 5
+        except (OSError, ConnectionError) as exc:
+            log.info("connection lost: %s", exc)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+
+if __name__ == "__main__":
+    main()

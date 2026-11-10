@@ -93,6 +93,7 @@ SCAN_BLACK="$(setting SCAN_BLACK 35)"
 SCAN_WHITE="$(setting SCAN_WHITE 225)"
 SCAN_GAMMA="$(setting SCAN_GAMMA 1.15)"
 SCAN_SHARPEN="$(setting SCAN_SHARPEN 1.2,80,3)"
+SCAN_AUTOCROP="$(setting SCAN_AUTOCROP 1)"
 [[ $SCAN_DPI =~ ^(200|300|400|600)$ ]] || die "SCAN_DPI must be 200, 300, 400 or 600"
 [[ $SCAN_COLOR =~ ^(C024|M008|M001)$ ]] || die "SCAN_COLOR must be C024, M008 or M001"
 [[ $FALLBACK_DIR == /* && $FALLBACK_DIR != *[[:space:]]* ]] || die "FALLBACK_DIR must be an absolute path without spaces"
@@ -104,13 +105,13 @@ trap 'rm -rf "$tmp"' EXIT
 log "Fetching es60w-scand from $REPO_RAW"
 curl -fsSL "$REPO_RAW/es60w-scand/es60w-scand" -o "$tmp/es60w-scand"
 
-# Python 3.9+ runs the daemon; Pillow is only needed for sharpening.
+# Python 3.9+ runs the daemon; Pillow is only needed for autocrop and sharpening.
 if ! ct sh -c 'python3 -c "import sys; sys.exit(sys.version_info < (3, 9))"' 2>/dev/null; then
     log "Installing python3 in container $CTID"
     ct env DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 sh -c 'apt-get update -qq && apt-get install -y -qq python3 >/dev/null'
 fi
-if [[ $SCAN_SHARPEN != 0 ]] && ! ct python3 -c 'import PIL' 2>/dev/null; then
-    log "Installing python3-pil (for sharpening) in container $CTID"
+if [[ $SCAN_SHARPEN != 0 || $SCAN_AUTOCROP == 1 ]] && ! ct python3 -c 'import PIL' 2>/dev/null; then
+    log "Installing python3-pil (for autocrop and sharpening) in container $CTID"
     ct env DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 sh -c 'apt-get update -qq && apt-get install -y -qq python3-pil >/dev/null'
 fi
 
@@ -135,6 +136,9 @@ SCAN_TONE=$SCAN_TONE
 SCAN_BLACK=$SCAN_BLACK
 SCAN_WHITE=$SCAN_WHITE
 SCAN_GAMMA=$SCAN_GAMMA
+# trim the dark feeder background beside narrower paper (A4, receipts; width
+# only, needs python3-pil); 0 turns it off
+SCAN_AUTOCROP=$SCAN_AUTOCROP
 # unsharp mask "radius,percent,threshold" (needs python3-pil); 0 turns it off
 SCAN_SHARPEN=$SCAN_SHARPEN
 EOF

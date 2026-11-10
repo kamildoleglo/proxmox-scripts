@@ -49,7 +49,8 @@ To run without prompts, set env vars:
 ## Using it
 
 Load paper **face down, top edge first** and press the scan button. Pages come out upright,
-in order, as `es60w_<date>_<time>.pdf`. A page takes about 5 seconds at 300 dpi.
+in order, cropped to the paper, as `es60w_<date>_<time>.pdf`. A page takes about 5 seconds
+at 300 dpi.
 
 The scanner runs on battery and turns itself off when idle. That's fine: when it switches
 off the daemon lets go, and when it comes back the daemon reconnects within a few seconds
@@ -73,10 +74,21 @@ In `/etc/es60w-scand.env` in the container. After editing, run
 | `SCAN_TONE` | `1` | `1` applies the levels curve below, `0` sends the raw image |
 | `SCAN_BLACK` / `SCAN_WHITE` | `35` / `225` | input levels mapped to black and white. The defaults turn slightly grey paper white and text darker. Lower `SCAN_WHITE` or raise `SCAN_BLACK` for more contrast |
 | `SCAN_GAMMA` | `1.15` | midtones; above 1 makes text darker |
+| `SCAN_AUTOCROP` | `1` | trims the dark feeder background beside paper narrower than 8.5″ (A4, receipts, cards); `0` turns it off. Needs `python3-pil` |
 | `SCAN_SHARPEN` | `1.2,80,3` | unsharp mask `radius,percent,threshold`; `0` turns it off. Needs `python3-pil`, which the installer adds |
 
 The levels curve is applied by the scanner itself (the same correction tables Epson's
-software sends), so it costs nothing. Sharpening re-encodes each page once.
+software sends), so it costs nothing. Cropping and sharpening re-encode a page once, and
+only when they change it.
+
+**Autocrop** only touches the width. The scanner already finds where each page ends, but
+it always scans the full 8.5″ feeder width, so anything narrower comes with a dark strip
+beside it. The daemon finds the columns that are mostly paper (brighter than the
+background) and keeps the span between them, minus 2 pixels for the shadow at the paper's
+edge. The top and bottom are never cropped, so a dark band across a document is safe.
+Dark paper looks like background, so pages where no paper is found are left uncropped.
+There's no deskew; Paperless can straighten pages during OCR with
+`PAPERLESS_OCR_USER_ARGS='{"deskew": true}'`.
 
 ## Managing it
 
@@ -104,8 +116,8 @@ ESC/I-2 commands, the same protocol SANE's `epsonds` backend and Epson Scan use.
    The daemon then sets the scan parameters (including the tone curve), starts the
    transfer and collects one JPEG per page until the feeder is empty. The scanner pads
    each JPEG and reports the real page height only at the end; the daemon trims the
-   padding and fixes the height before wrapping the pages into a PDF without re-encoding
-   them (unless sharpening is on).
+   padding and fixes the height, crops away the background beside narrower paper, and
+   wraps the pages into a PDF (re-encoding a page only if it was cropped or sharpened).
 3. **Saving.** The PDF is written as `….pdf.part`, which Paperless ignores, and renamed to
    the first free `es60w_<date>_<time>[_n].pdf`. Nothing in the folder is ever overwritten
    or deleted.

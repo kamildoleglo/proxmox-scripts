@@ -33,6 +33,8 @@ Configuration via environment variables (all optional except OUTPUT_DIR):
   SCAN_BLACK     input level mapped to black         (default 35)
   SCAN_WHITE     input level mapped to white         (default 225)
   SCAN_GAMMA     midtone curve, >1 = darker text     (default 1.15)
+  SCAN_AUTOCROP  1 = trim the dark feeder background beside narrower paper
+                 (width only, via Pillow; default 1)
   SCAN_SHARPEN   unsharp mask "radius,percent,threshold" via Pillow, 0 = off
                  (default 1.2,80,3; skipped if Pillow is missing)
   LOG_LEVEL      DEBUG/INFO                         (default INFO)
@@ -312,20 +314,66 @@ def run_scan(link, cfg):
     return pages
 
 
-def sharpen_pages(pages, cfg):
-    """Optional unsharp mask via Pillow; pages unchanged if Pillow is missing."""
-    if not cfg["sharpen"]:
+CROP_PAPER_LEVEL = 160    # paper is brighter than this, the feeder background darker
+CROP_MIN_FRACTION = 0.5   # a column is paper when at least half its pixels are
+CROP_RUN = 5              # ... for this many columns in a row (ignores specks)
+CROP_INSET = 2            # px trimmed inside the edge (drops the edge shadow)
+CROP_MIN_WIDTH_IN = 0.75  # narrower "paper" means dark paper: don't crop
+
+
+def autocrop_box(img, dpi):
+    """(left, 0, right, height) of the paper, or None to keep the page as is.
+
+    The feeder is 8.5" wide and the scanner only trims the length, so narrower
+    paper (A4, receipts, cards) comes with dark background beside it. Only the
+    width is cropped: a dark band across a document's top must never be cut.
+    """
+    from PIL import Image
+    mask = img.convert("L").point(lambda v: 255 if v > CROP_PAPER_LEVEL else 0)
+    # Averaging each column down to one pixel = share of paper pixels in it.
+    cols = list(mask.resize((img.width, 1), Image.BOX).getdata())
+    need = 255 * CROP_MIN_FRACTION
+    is_paper = [c >= need for c in cols]
+    run = CROP_RUN
+    left = next((x for x in range(len(cols) - run) if all(is_paper[x:x + run])), None)
+    right = next((x for x in range(len(cols) - 1, run - 1, -1) if all(is_paper[x - run + 1:x + 1])), None)
+    if left is None or right is None:
+        return None
+    left, right = left + CROP_INSET, right + 1 - CROP_INSET
+    if right - left < CROP_MIN_WIDTH_IN * dpi:
+        return None
+    if left <= CROP_INSET and right >= img.width - CROP_INSET:
+        return None  # paper fills the feeder: nothing to crop
+    return (left, 0, right, img.height)
+
+
+def postprocess_pages(pages, cfg):
+    """Autocrop and sharpen via Pillow; pages unchanged if Pillow is missing.
+    A page is only re-encoded when something was actually changed."""
+    if not cfg["autocrop"] and not cfg["sharpen"]:
         return pages
     try:
         from PIL import Image, ImageFilter
     except ImportError:
-        log.warning("SCAN_SHARPEN is on but Pillow is not installed; skipping")
+        log.warning("SCAN_AUTOCROP/SCAN_SHARPEN need Pillow (python3-pil), which is missing; skipping")
         return pages
-    radius, percent, threshold = cfg["sharpen"]
     out = []
-    for jpeg, w, h in pages:
+    for n, (jpeg, w, h) in enumerate(pages, 1):
         img = Image.open(io.BytesIO(jpeg))
-        img = img.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=threshold))
+        changed = False
+        if cfg["autocrop"]:
+            box = autocrop_box(img, cfg["dpi"])
+            if box:
+                img = img.crop(box)
+                changed = True
+                log.info("page %d: cropped to %.2f x %.2f in", n, img.width / cfg["dpi"], img.height / cfg["dpi"])
+        if cfg["sharpen"]:
+            radius, percent, threshold = cfg["sharpen"]
+            img = img.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=threshold))
+            changed = True
+        if not changed:
+            out.append((jpeg, w, h))
+            continue
         buf = io.BytesIO()
         img.save(buf, "JPEG", quality=cfg["jpeg_q"], dpi=(cfg["dpi"], cfg["dpi"]), optimize=True)
         out.append((buf.getvalue(), img.width, img.height))
@@ -496,9 +544,9 @@ def handle(link, cfg, value):
         log.warning("no pages scanned (feeder empty?)")
         return
     try:
-        pages = sharpen_pages(pages, cfg)
+        pages = postprocess_pages(pages, cfg)
     except Exception as exc:  # noqa: BLE001 - never lose a scan over post-processing
-        log.error("sharpening failed (%s), keeping the unsharpened pages", exc)
+        log.error("cropping/sharpening failed (%s), keeping the pages as scanned", exc)
     pdf = build_pdf(pages, cfg["dpi"])
     try:
         target = save_pdf(cfg["output_dir"], pdf)
@@ -537,6 +585,7 @@ def main():
         "white": int(env.get("SCAN_WHITE", "225")),
         "gamma": float(env.get("SCAN_GAMMA", "1.15")),
         "sharpen": None,
+        "autocrop": env.get("SCAN_AUTOCROP", "1") == "1",
     }
     if env.get("SCAN_SHARPEN", "1.2,80,3") not in ("", "0"):
         r, p, t = env.get("SCAN_SHARPEN", "1.2,80,3").split(",")
@@ -545,9 +594,9 @@ def main():
         sys.exit("need 0 <= SCAN_BLACK < SCAN_WHITE <= 255")
     if cfg["dpi"] not in (200, 300, 400, 600):
         sys.exit("SCAN_DPI must be 200, 300, 400 or 600")
-    log.info("es60w-scand: %d dpi %s, tone %s, sharpen %s -> %s", cfg["dpi"], cfg["color"],
+    log.info("es60w-scand: %d dpi %s, tone %s, autocrop %s, sharpen %s -> %s", cfg["dpi"], cfg["color"],
              f"{cfg['black']}-{cfg['white']} g{cfg['gamma']}" if cfg["tone"] else "off",
-             cfg["sharpen"] or "off", cfg["output_dir"])
+             "on" if cfg["autocrop"] else "off", cfg["sharpen"] or "off", cfg["output_dir"])
     try:
         run_forever(cfg)
     except KeyboardInterrupt:

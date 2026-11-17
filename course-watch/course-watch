@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""Watches the marriage-preparation course list on narzeczeni.sosnowiec.pl and mails
+you when a new course appears or a full course gets free seats again.
+
+Installed in its own LXC as /usr/local/bin/course-watch and run by a timer. Also works on
+any machine with Python 3 (no extra packages). Settings come from KEY=value lines in
+/etc/default/course-watch (another file with CONFIG=...) or environment variables, which
+win:
+
+  MAIL_TO        recipients, comma-separated
+  SMTP_HOST      mail server; empty sends with the local sendmail instead
+  SMTP_PORT      default 465 for tls, 587 for starttls, 25 for none
+  SMTP_SECURITY  tls, starttls (default) or none
+  SMTP_USER, SMTP_PASSWORD   login, if the server wants one
+  MAIL_FROM      sender address, default SMTP_USER
+  URL            page with the course table
+  STATE          where the last seen table is kept (JSON)
+
+  course-watch          check once and mail about changes
+  course-watch --list   print the current table, change nothing
+  course-watch --test   send a test mail with the current table
+
+A failed check (site down, table gone) is mailed once; the next one is mailed only after
+a check has succeeded again.
+"""
+import html.parser
+import json
+import os
+import shutil
+import smtplib
+import ssl
+import subprocess
+import sys
+import time
+import urllib.request
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
+
+
+def read_config(path):
+    """KEY=value lines, value taken literally; a missing file means no settings."""
+    conf = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                key, sep, value = line.rstrip("\r\n").partition("=")
+                key = key.strip()
+                if sep and key.isidentifier():
+                    if len(value) >= 2 and value[0] == value[-1] == '"':
+                        value = value[1:-1]
+                    conf[key] = value
+    except FileNotFoundError:
+        pass
+    return conf
+
+
+CONF = {**read_config(os.environ.get("CONFIG") or "/etc/default/course-watch"), **os.environ}
+URL = CONF.get("URL") or "https://narzeczeni.sosnowiec.pl/kursy-przedmalzenskie/"
+STATE = CONF.get("STATE") or "/var/lib/course-watch/state.json"
+FAILED_FLAG = STATE + ".failed"
+MAIL_TO = [a.strip() for a in (CONF.get("MAIL_TO") or "root").split(",") if a.strip()]
+SMTP_HOST = CONF.get("SMTP_HOST", "")
+SMTP_SECURITY = (CONF.get("SMTP_SECURITY") or "starttls").lower()
+SMTP_PORT = int(CONF.get("SMTP_PORT") or {"tls": 465, "starttls": 587}.get(SMTP_SECURITY, 25))
+SMTP_USER = CONF.get("SMTP_USER", "")
+SMTP_PASSWORD = CONF.get("SMTP_PASSWORD", "")
+MAIL_FROM = CONF.get("MAIL_FROM") or SMTP_USER
+USER_AGENT = "Mozilla/5.0 (compatible; course-watch)"
+
+
+class CheckFailed(Exception):
+    """The page couldn't be checked: worth a mail, once."""
+
+
+def log(msg):
+    print(f"==> {msg}", flush=True)
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+class CourseTable(html.parser.HTMLParser):
+    """Collects the rows of <tr class="course-item">, keyed by the <td> classes."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.courses = []
+        self.row = None
+        self.cell = None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        classes = (a.get("class") or "").split()
+        if tag == "tr" and "course-item" in classes:
+            self.row = {}
+        elif self.row is None:
+            return
+        elif tag == "td":
+            name = next((c[len("course-item__"):] for c in classes if c.startswith("course-item__")), "")
+            self.cell = name
+            self.row.setdefault(name, "")
+        elif tag == "a" and self.cell == "title" and "url" not in self.row:
+            self.row["url"] = a.get("href", "")
+        elif tag == "span" and self.cell == "title" and "course-item__subtitle" in classes:
+            self.cell = "subtitle"
+            self.row.setdefault("subtitle", "")
+
+    def handle_endtag(self, tag):
+        if self.row is None:
+            return
+        if tag == "span" and self.cell == "subtitle":
+            self.cell = "title"
+        elif tag == "td":
+            self.cell = None
+        elif tag == "tr":
+            self.courses.append({k: " ".join(v.split()) for k, v in self.row.items()})
+            self.row = self.cell = None
+
+    def handle_data(self, data):
+        if self.row is not None and self.cell:
+            self.row[self.cell] += data
+
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read().decode(r.headers.get_content_charset() or "utf-8", "replace")
+        except OSError as e:
+            if attempt == 2:
+                raise CheckFailed(f"can't fetch {url}: {e}")
+            time.sleep(30 * (attempt + 1))
+
+
+def courses():
+    p = CourseTable()
+    p.feed(fetch(URL))
+    found = {}
+    for c in p.courses:
+        key = c.get("url") or f"{c.get('date')}|{c.get('title')}"
+        found[key] = {
+            "date": c.get("date", ""),
+            "title": c.get("title", ""),
+            "when": c.get("subtitle", ""),
+            "seats": c.get("available", ""),
+            "url": c.get("url", ""),
+        }
+    if not found:
+        raise CheckFailed(f"no courses found in the table on {URL} - did the page change?")
+    return found
+
+
+def free(seats):
+    return seats.isdigit() and int(seats) > 0
+
+
+def describe(c):
+    seats = c["seats"] if c["seats"] else "?"
+    lines = [f"{c['title']}", f"  {c['when'] or c['date']}, free seats: {seats}"]
+    if c["url"]:
+        lines.append(f"  {c['url']}")
+    return "\n".join(lines)
+
+
+def mail(subject, body):
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["To"] = ", ".join(MAIL_TO)
+    if MAIL_FROM:
+        msg["From"] = f"course-watch <{MAIL_FROM}>"
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=(MAIL_FROM.rpartition("@")[2] or None))
+    msg.set_content(body)
+    try:
+        if SMTP_HOST:
+            if SMTP_SECURITY not in ("tls", "starttls", "none"):
+                die(f"SMTP_SECURITY must be tls, starttls or none, not '{SMTP_SECURITY}'")
+            if not MAIL_FROM:
+                die("set MAIL_FROM (or SMTP_USER) to send through SMTP")
+            ctx = ssl.create_default_context()
+            if SMTP_SECURITY == "tls":
+                smtp = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=60, context=ctx)
+            else:
+                smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60)
+            with smtp:
+                if SMTP_SECURITY == "starttls":
+                    smtp.starttls(context=ctx)
+                if SMTP_USER:
+                    smtp.login(SMTP_USER, SMTP_PASSWORD)
+                smtp.send_message(msg)
+        else:
+            sendmail = shutil.which("sendmail") or "/usr/sbin/sendmail"
+            subprocess.run([sendmail, "-i", *MAIL_TO], input=msg.as_bytes(), check=True, timeout=60)
+    except (OSError, smtplib.SMTPException, subprocess.SubprocessError) as e:
+        die(f"mail to {', '.join(MAIL_TO)} failed: {e}")
+    log(f"mailed {', '.join(MAIL_TO)}: {subject}")
+
+
+def load_state():
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        die(f"can't read {STATE}: {e}")
+
+
+def save_state(current):
+    os.makedirs(os.path.dirname(os.path.abspath(STATE)), exist_ok=True)
+    tmp = f"{STATE}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(current, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, STATE)
+
+
+def check(arg):
+    current = courses()
+    listing = "\n\n".join(describe(c) for c in current.values())
+
+    if arg == "--list":
+        print(listing)
+        return
+    if arg == "--test":
+        mail("course-watch: test", f"Mail works. Courses on {URL} now:\n\n{listing}")
+        return
+
+    previous = load_state()
+    if previous is None:
+        mail("course-watch: watching the course list",
+             f"From now on you'll hear about new courses and freed-up seats on {URL}.\n"
+             f"Courses now:\n\n{listing}")
+        save_state(current)
+        log(f"first run, {len(current)} courses recorded")
+        return
+
+    new = [c for k, c in current.items() if k not in previous]
+    reopened = [c for k, c in current.items()
+                if k in previous and free(c["seats"]) and not free(previous[k].get("seats", ""))]
+    if not new and not reopened:
+        save_state(current)    # keeps seat counts current, so a later 0 -> N is noticed
+        log(f"no changes ({len(current)} courses)")
+        return
+
+    parts = []
+    if new:
+        parts.append("New courses:\n\n" + "\n\n".join(describe(c) for c in new))
+    if reopened:
+        parts.append("Free seats again:\n\n" + "\n\n".join(describe(c) for c in reopened))
+    parts.append(f"Sign up: {URL}")
+    if new and reopened:
+        title = f"{len(new)} new course(s), {len(reopened)} with free seats again"
+    elif new:
+        title = f"New marriage course: {new[0]['title']}" if len(new) == 1 else f"{len(new)} new marriage courses"
+    else:
+        title = f"Free seats: {reopened[0]['title']}" if len(reopened) == 1 else f"{len(reopened)} courses have free seats"
+    # The state is saved only after the mail went out, so nothing is missed.
+    mail(title, "\n\n".join(parts))
+    save_state(current)
+    log(f"{len(new)} new, {len(reopened)} with free seats again")
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg not in ("", "--list", "--test"):
+        die(f"usage: {os.path.basename(sys.argv[0])} [--list | --test]")
+    try:
+        check(arg)
+    except CheckFailed as e:
+        print(f"error: {e}", file=sys.stderr)
+        if not arg and not os.path.exists(FAILED_FLAG):
+            mail("course-watch: check failed",
+                 f"{e}\n\nYou won't get another mail about failures until a check succeeds again."
+                 f"\nThe page: {URL}")
+            os.makedirs(os.path.dirname(os.path.abspath(FAILED_FLAG)), exist_ok=True)
+            open(FAILED_FLAG, "w").close()
+        sys.exit(1)
+    if not arg and os.path.exists(FAILED_FLAG):
+        os.remove(FAILED_FLAG)
+
+
+if __name__ == "__main__":
+    main()

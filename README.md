@@ -9,6 +9,7 @@ One-command installers for Proxmox VE, in the style of
 | [larapaper](larapaper/) | [LaraPaper](https://github.com/usetrmnl/larapaper) LXC: a self-hosted server for TRMNL e-ink displays |
 | [host-backup](host-backup/) | Nightly backup of the host's own configuration (`/etc/pve`, mounts, network), for rebuilding after a disk failure |
 | [es60w-scand](es60w-scand/) | Scan button on an Epson ES-60W (Wi-Fi) → PDF in Paperless-ngx's consume folder, no Windows needed |
+| [course-watch](course-watch/) | LXC that checks the Sosnowiec marriage-course list every 6 hours and mails you about new courses and freed-up seats |
 
 ## Reverse proxy
 
@@ -41,3 +42,11 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/kamildoleglo/proxmox-scr
 ```
 
 Details in [es60w-scand/README.md](es60w-scand/README.md).
+
+## Marriage course watcher
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/kamildoleglo/proxmox-scripts/main/course-watch/install.sh)"
+```
+
+Details in [course-watch/README.md](course-watch/README.md).

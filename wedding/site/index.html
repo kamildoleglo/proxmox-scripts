@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ewa &amp; Kamil · 24 kwietnia 2027</title>
+<meta name="description" content="Ślub Ewy i Kamila, 24 kwietnia 2027. Dojazd, plan dnia i potwierdzenie obecności.">
+<!-- The site is shared only through the invitations; keep it out of search engines. -->
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#ffffff">
+<meta property="og:title" content="Ewa &amp; Kamil · 24 kwietnia 2027">
+<meta property="og:description" content="Dojazd, plan dnia i potwierdzenie obecności.">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600&family=Great+Vibes&family=Montserrat:wght@400;500&family=Playfair+Display&display=swap">
+<link rel="preload" as="image" href="flowers.webp">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="flowers" aria-hidden="true"><img src="flowers.webp" alt=""></div>
+<div class="flowers flowers-right" aria-hidden="true"><img src="flowers.webp" alt=""></div>
+
+<main>
+  <header class="hero">
+    <h1 class="names">Ewa<br>&amp; Kamil</h1>
+    <p class="script">Zapraszamy na nasz ślub</p>
+    <hr>
+    <p class="spaced date"><time datetime="2027-04-24T14:00">24 kwietnia 2027<br>14:00</time></p>
+    <p class="spaced countdown" id="countdown" hidden></p>
+  </header>
+
+  <section>
+    <h2 class="script">Ceremonia</h2>
+    <p class="spaced small">Godzina 14:00</p>
+    <p class="caps">Parafia św. Barbary<br>w Jaworznie</p>
+    <a class="button" href="https://www.google.com/maps/dir/?api=1&amp;destination=Parafia%20%C5%9Bw.%20Barbary%20w%20Jaworznie" target="_blank" rel="noopener">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.3"/></svg>
+      Wyznacz trasę
+    </a>
+  </section>
+
+  <hr>
+
+  <section>
+    <h2 class="script">Przyjęcie weselne</h2>
+    <p class="spaced small">Po ceremonii</p>
+    <p class="caps">Sala „Cztery Pory Roku”<br>ul. Adama Mickiewicza 1E<br>Alwernia</p>
+    <a class="button" href="https://www.google.com/maps/dir/?api=1&amp;destination=Wesela%20Cztery%20Pory%20Roku%2C%20Adama%20Mickiewicza%201E%2C%20Alwernia" target="_blank" rel="noopener">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.3"/></svg>
+      Wyznacz trasę
+    </a>
+  </section>
+
+  <hr>
+
+  <section>
+    <h2 class="script">Plan dnia</h2>
+    <!-- One line per item, shown in this order (no sorting, so times after midnight are fine). -->
+    <ol class="timeline">
+      <li><time>14:00</time><span>Ślub</span></li>
+      <li><time>16:00</time><span>Przywitanie gości</span></li>
+      <li><time>16:30</time><span>Obiad</span></li>
+      <li><time>22:00</time><span>Kolacja</span></li>
+      <li><time>24:00</time><span>Oczepiny</span></li>
+      <li><time>02:22</time><span>Ciepły posiłek</span></li>
+    </ol>
+  </section>
+
+  <hr>
+
+  <section>
+    <h2 class="script">Potwierdzenie</h2>
+    <p class="caps">Prosimy o potwierdzenie obecności<br>do 31 stycznia 2027</p>
+    <!-- TODO: real phone numbers. Change both the visible text and the tel: link. -->
+    <dl class="rsvp spaced small">
+      <dt>RSVP</dt><dd>31.01.2027</dd>
+      <dt>Ewa</dt><dd><a href="tel:+48000000000">000 000 000</a></dd>
+      <dt>Kamil</dt><dd><a href="tel:+48000000000">000 000 000</a></dd>
+    </dl>
+  </section>
+
+  <footer class="spaced small">Ewa &amp; Kamil · 24.04.2027</footer>
+</main>
+
+<script>
+  // Days left until the wedding, in the visitor's time zone.
+  (function () {
+    var el = document.getElementById("countdown");
+    var now = new Date();
+    var today = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+    var days = Math.round((Date.UTC(2027, 3, 24) - today) / 86400000);
+    if (days > 1) el.textContent = "Jeszcze " + days + " dni";
+    else if (days === 1) el.textContent = "Już jutro";
+    else if (days === 0) el.textContent = "To już dziś";
+    else return;
+    el.hidden = false;
+  })();
+
+  // Sections fade in as they scroll into view.
+  (function () {
+    if (!("IntersectionObserver" in window) ||
+        matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add("shown"); io.unobserve(e.target); }
+      });
+    }, { rootMargin: "0px 0px -10% 0px" });
+    document.querySelectorAll("main > section").forEach(function (s) {
+      s.classList.add("reveal");
+      io.observe(s);
+    });
+  })();
+</script>
+</body>
+</html>

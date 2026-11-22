@@ -10,6 +10,7 @@ One-command installers for Proxmox VE, in the style of
 | [host-backup](host-backup/) | Nightly backup of the host's own configuration (`/etc/pve`, mounts, network), for rebuilding after a disk failure |
 | [es60w-scand](es60w-scand/) | Scan button on an Epson ES-60W (Wi-Fi) → PDF in Paperless-ngx's consume folder, no Windows needed |
 | [course-watch](course-watch/) | LXC that checks the Sosnowiec marriage-course list every 6 hours and mails you about new courses and freed-up seats |
+| [wedding](wedding/) | Caddy LXC serving the wedding website (directions, plan of the day, RSVP) behind the reverse proxy |
 
 ## Reverse proxy
 
@@ -50,3 +51,11 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/kamildoleglo/proxmox-scr
 ```
 
 Details in [course-watch/README.md](course-watch/README.md).
+
+## Wedding website
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/kamildoleglo/proxmox-scripts/main/wedding/install.sh)"
+```
+
+Details in [wedding/README.md](wedding/README.md).
